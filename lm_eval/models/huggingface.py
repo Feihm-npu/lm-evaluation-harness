@@ -1,8 +1,9 @@
 import copy
+import logging
 import os
 from datetime import timedelta
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import jinja2
 import torch
@@ -39,7 +40,7 @@ from lm_eval.models.utils import (
 )
 
 
-eval_logger = utils.eval_logger
+eval_logger = logging.getLogger(__name__)
 
 
 @register_model("hf-auto", "hf", "huggingface")
@@ -73,6 +74,7 @@ class HFLM(TemplateLM):
         max_length: Optional[int] = None,
         device: Optional[str] = "cuda",
         dtype: Optional[Union[str, torch.dtype]] = "auto",
+        softmax_dtype: Optional[Union[str, torch.dtype]] = None,
         batch_size: Optional[Union[int, str]] = 1,
         max_batch_size: Optional[int] = 64,
         trust_remote_code: Optional[bool] = False,
@@ -90,6 +92,7 @@ class HFLM(TemplateLM):
         delta: Optional[str] = None,
         autogptq: Optional[Union[bool, str]] = False,
         gptqmodel: Optional[bool] = False,
+        gguf_file: Optional[str] = None,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -98,7 +101,9 @@ class HFLM(TemplateLM):
             eval_logger.warning(
                 "`pretrained` model kwarg is not of type `str`. Many other model arguments may be ignored. Please do not launch via accelerate or use `parallelize=True` if passing an existing model this way."
             )
-            assert not parallelize, "`parallelize=True` is not compatible with passing pre-initialized model to `pretrained`"
+            assert not parallelize, (
+                "`parallelize=True` is not compatible with passing pre-initialized model to `pretrained`"
+            )
             self._model = pretrained
             self._device = self._model.device
             self._config = self._model.config
@@ -164,6 +169,7 @@ class HFLM(TemplateLM):
                 pretrained,
                 revision=revision,
                 trust_remote_code=trust_remote_code,
+                gguf_file=gguf_file,
             )
 
             # determine which of 'causal' and 'seq2seq' backends to use for HF models
@@ -178,6 +184,8 @@ class HFLM(TemplateLM):
             revision=revision,
             trust_remote_code=trust_remote_code,
             use_fast_tokenizer=use_fast_tokenizer,
+            gguf_file=gguf_file,
+            add_bos_token=add_bos_token,
         )
 
         # if we passed `pretrained` as a string, initialize our model now
@@ -196,6 +204,8 @@ class HFLM(TemplateLM):
                 delta=delta,
                 autogptq=autogptq,
                 gptqmodel=gptqmodel,
+                gguf_file=gguf_file,
+                quantization_config=getattr(self.config, "quantization_config", None),
                 **kwargs,
             )
 
@@ -225,6 +235,9 @@ class HFLM(TemplateLM):
         self.batch_schedule = 1
         self.batch_sizes = {}
         self.max_batch_size = max_batch_size
+        self.softmax_dtype = (
+            get_dtype(softmax_dtype) if softmax_dtype is not None else None
+        )
 
         if str(batch_size).startswith("auto"):
             batch_size = batch_size.split(":")
@@ -508,12 +521,14 @@ class HFLM(TemplateLM):
         pretrained: str,
         revision: str = "main",
         trust_remote_code: bool = False,
+        gguf_file: Optional[str] = None,
     ) -> None:
         """Return the model config for HuggingFace models"""
         self._config = transformers.AutoConfig.from_pretrained(
             pretrained,
             revision=revision,
             trust_remote_code=trust_remote_code,
+            gguf_file=gguf_file,
         )
 
     def _create_model(
@@ -535,6 +550,8 @@ class HFLM(TemplateLM):
         delta: Optional[str] = None,
         autogptq: Optional[Union[bool, str]] = False,
         gptqmodel: Optional[bool] = False,
+        gguf_file: Optional[str] = None,
+        quantization_config: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> None:
         """
@@ -564,9 +581,9 @@ class HFLM(TemplateLM):
 
         if not autogptq and not gptqmodel:
             if model_kwargs.get("load_in_4bit", None):
-                assert (
-                    transformers.__version__ >= "4.30.0"
-                ), "load_in_4bit requires transformers >= 4.30.0"
+                assert transformers.__version__ >= "4.30.0", (
+                    "load_in_4bit requires transformers >= 4.30.0"
+                )
             if transformers.__version__ >= "4.30.0":
                 if model_kwargs.get("load_in_4bit", None):
                     if model_kwargs.get("bnb_4bit_compute_dtype", None):
@@ -579,6 +596,8 @@ class HFLM(TemplateLM):
                 revision=revision,
                 torch_dtype=get_dtype(dtype),
                 trust_remote_code=trust_remote_code,
+                gguf_file=gguf_file,
+                quantization_config=quantization_config,
                 **model_kwargs,
             )
         else:
@@ -676,6 +695,8 @@ class HFLM(TemplateLM):
         revision: Optional[str] = "main",
         trust_remote_code: Optional[bool] = False,
         use_fast_tokenizer: Optional[bool] = True,
+        gguf_file: Optional[str] = None,
+        add_bos_token: Optional[bool] = False,
     ) -> None:
         """
         Helper method during initialization.
@@ -683,14 +704,24 @@ class HFLM(TemplateLM):
         Create a tokenizer object corresponding to the correct
         tokenizer for value of `pretrained`, or use the pre-initialized tokenizer passed.
         """
+        kwargs = {
+            "revision": revision,
+            "trust_remote_code": trust_remote_code,
+        }
+
+        # gguf format embeds tokenizer and is not compatible with hf tokenizer `use_fast` param
+        if gguf_file is not None:
+            kwargs["gguf_file"] = gguf_file
+        else:
+            kwargs["use_fast"] = use_fast_tokenizer
+
+        if add_bos_token:
+            kwargs["add_bos_token"] = True
 
         if tokenizer:
             if isinstance(tokenizer, str):
                 self.tokenizer = transformers.AutoTokenizer.from_pretrained(
-                    tokenizer,
-                    revision=revision,
-                    trust_remote_code=trust_remote_code,
-                    use_fast=use_fast_tokenizer,
+                    tokenizer, **kwargs
                 )
             else:
                 assert isinstance(
@@ -705,10 +736,7 @@ class HFLM(TemplateLM):
                 # get the HF hub name via accessor on model
                 model_name = self.model.name_or_path
             self.tokenizer = transformers.AutoTokenizer.from_pretrained(
-                model_name,
-                revision=revision,
-                trust_remote_code=trust_remote_code,
-                use_fast=use_fast_tokenizer,
+                model_name, **kwargs
             )
         return None
 
@@ -744,7 +772,11 @@ class HFLM(TemplateLM):
                     (batch_size, max_length), device=self.device
                 ).long()
             for _ in range(5):
-                out = F.log_softmax(self._model_call(test_batch, **call_kwargs), dim=-1)  # noqa: F841
+                out = F.log_softmax(  # noqa: F841
+                    self._model_call(test_batch, **call_kwargs),
+                    dim=-1,
+                    dtype=self.softmax_dtype,
+                )
 
             return batch_size
 
@@ -818,6 +850,12 @@ class HFLM(TemplateLM):
             **add_special_tokens,
         )
         if left_truncate_len:
+            original_lengths = encoding["input_ids"].size(1)
+            if original_lengths > left_truncate_len:
+                eval_logger.warn(
+                    f"Left truncation applied. Original sequence length was {original_lengths}, "
+                    f"truncating to last {left_truncate_len} tokens. Some content will be lost.",
+                )
             encoding["input_ids"] = encoding["input_ids"][:, -left_truncate_len:]
             encoding["attention_mask"] = encoding["attention_mask"][
                 :, -left_truncate_len:
@@ -852,7 +890,10 @@ class HFLM(TemplateLM):
                     input_ids=inps, attention_mask=attn_mask, labels=labels
                 ).logits
             else:
-                assert self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM
+                assert self.AUTO_MODEL_CLASS in (
+                    transformers.AutoModelForCausalLM,
+                    transformers.AutoModelForVision2Seq,
+                )
                 return self.model(inps).logits
 
     def _model_generate(self, context, max_length, stop, **generation_kwargs):
@@ -886,16 +927,16 @@ class HFLM(TemplateLM):
         self, logits: torch.Tensor, contlen: int = None, inplen: int = None
     ) -> torch.Tensor:
         if self.backend == "causal":
-            assert (
-                contlen and inplen
-            ), "Must pass input len and cont. len to select scored logits for causal LM"
+            assert contlen and inplen, (
+                "Must pass input len and cont. len to select scored logits for causal LM"
+            )
             # discard right-padding.
             # also discard the input/context tokens. we'll only score continuations.
             logits = logits[inplen - contlen : inplen]
         elif self.backend == "seq2seq":
-            assert (
-                contlen and not inplen
-            ), "Selecting scored logits for Seq2SeqLM requires only cont. len"
+            assert contlen and not inplen, (
+                "Selecting scored logits for Seq2SeqLM requires only cont. len"
+            )
             # only discard right-padding.
             # the logits input to this fn only contain decoder-side tokens.
             logits = logits[:contlen]
@@ -905,8 +946,6 @@ class HFLM(TemplateLM):
     def loglikelihood_rolling(
         self, requests: List[Instance], disable_tqdm: bool = False
     ) -> List[float]:
-        loglikelihoods = []
-
         adaptive_batch_size = None
         if self.batch_size == "auto":
             # using rolling window with maximum context
@@ -915,10 +954,17 @@ class HFLM(TemplateLM):
             print(f"Determined Largest batch size: {batch_size}")
             adaptive_batch_size = batch_size
 
-        for (string,) in tqdm(
-            [req.args for req in requests], disable=(disable_tqdm or (self.rank != 0))
+        # First, collect all windows from all requests
+        all_windows = []  # List of (request_idx, window) tuples
+        request_window_counts = []  # Track number of windows per request
+
+        for req_idx, (string,) in enumerate(
+            tqdm(
+                [req.args for req in requests],
+                disable=(disable_tqdm or (self.rank != 0)),
+            )
         ):
-            rolling_token_windows = list(
+            rolling_token_windows: List[Tuple[List[int], List[int]]] = list(
                 map(
                     utils.make_disjoint_window,
                     utils.get_rolling_token_windows(
@@ -931,37 +977,55 @@ class HFLM(TemplateLM):
             )
 
             # TODO: Right now, we pass single EOT token to the Encoder and the full context to the decoder, in seq2seq case
-            rolling_token_windows = [(None,) + x for x in rolling_token_windows]
+            windows = [(None,) + x for x in rolling_token_windows]
 
-            pad_amnt = 0
-            if self.world_size > 1:
-                # We pad out the external document-level iterator so the inner iterator doesn't hang
-                mytensor = torch.tensor(len(rolling_token_windows), device=self.device)
-                gathered = (
-                    self.accelerator.gather(mytensor).cpu().detach().numpy().tolist()
-                )
+            # Store windows with their request index
+            all_windows.extend((req_idx, window) for window in windows)
+            request_window_counts.append(len(windows))
 
-                pad_amnt = max(gathered) - gathered[self.rank]
-                if pad_amnt > 0:
-                    rolling_token_windows += pad_amnt * [rolling_token_windows[0]]
+        # Handle distributed case padding
+        pad_amnt = 0
+        if self.world_size > 1:
+            mytensor = torch.tensor(len(all_windows), device=self.device)
+            gathered = self.accelerator.gather(mytensor).cpu().detach().numpy().tolist()
+            pad_amnt = max(gathered) - gathered[self.rank]
+            if pad_amnt > 0:
+                all_windows += pad_amnt * [all_windows[0]]
 
-            string_nll = self._loglikelihood_tokens(
-                requests=rolling_token_windows,
-                disable_tqdm=True,
-                override_bs=adaptive_batch_size,
+        all_nlls = []
+        batch_size = adaptive_batch_size or self.batch_size
+        for i in range(0, len(all_windows), batch_size):
+            batch = all_windows[i : i + batch_size]
+            # Extract just the windows for processing, keeping track of request indices
+            batch_indices, batch_windows = zip(*batch)
+
+            batch_nlls = self._loglikelihood_tokens(
+                requests=batch_windows,
+                disable_tqdm=False,
+                override_bs=len(batch_windows),
             )
+            # Store results with their request indices
+            all_nlls.extend(zip(batch_indices, batch_nlls))
 
-            if (self.world_size > 1) and (pad_amnt > 0):
-                string_nll = [x[0] for x in string_nll[:-pad_amnt]]
-            else:
-                # discard is_greedy
-                string_nll = [x[0] for x in string_nll]
+        # Remove padding if necessary
+        if (self.world_size > 1) and (pad_amnt > 0):
+            all_nlls = all_nlls[:-pad_amnt]
 
-            string_nll = sum(string_nll)
-            loglikelihoods.append(string_nll)
+        # Reconstruct per-request loglikelihoods
+        loglikelihoods = []
+        current_idx = 0
+        for window_count in request_window_counts:
+            # Get all nlls for this request
+            request_nlls = all_nlls[current_idx : current_idx + window_count]
+            # Sum up the nlls for this request (discarding is_greedy)
+            request_total = sum(nll[0] for _, nll in request_nlls)
+            loglikelihoods.append(request_total)
+            current_idx += window_count
 
-            # cache this loglikelihood_rolling request
-            self.cache_hook.add_partial("loglikelihood_rolling", (string,), string_nll)
+            string = requests[len(loglikelihoods) - 1].args[0]
+            self.cache_hook.add_partial(
+                "loglikelihood_rolling", (string,), request_total
+            )
 
         return loglikelihoods
 
@@ -1073,6 +1137,13 @@ class HFLM(TemplateLM):
 
                 # when too long to fit in context, truncate from the left
                 if self.backend == "causal":
+                    total_length = len(context_enc) + len(continuation_enc)
+                    if total_length > self.max_length + 1:
+                        eval_logger.warning(
+                            f"Combined length of context ({len(context_enc)}) and continuation ({len(continuation_enc)}) "
+                            f"exceeds model's maximum length ({self.max_length}). "
+                            f"Truncating {total_length - self.max_length + 1} tokens from the left."
+                        )
                     inp = torch.tensor(
                         (context_enc + continuation_enc)[-(self.max_length + 1) :][:-1],
                         dtype=torch.long,
@@ -1140,7 +1211,9 @@ class HFLM(TemplateLM):
                 }
 
             multi_logits = F.log_softmax(
-                self._model_call(batched_inps, **call_kwargs), dim=-1
+                self._model_call(batched_inps, **call_kwargs),
+                dim=-1,
+                dtype=self.softmax_dtype,
             )  # [batch, padding_length (inp or cont), vocab]
 
             for (request_str, ctx_tokens, _), logits, inplen, cont_toks in zip(
@@ -1177,7 +1250,12 @@ class HFLM(TemplateLM):
                     cont_toks = torch.tensor(
                         cont_toks, dtype=torch.long, device=self.device
                     ).unsqueeze(0)  # [1, seq]
-                    max_equal = (greedy_tokens == cont_toks).all()
+                    # Use trailing slice [-cont_toks.shape[1]:] to handle variable length cont_len (but same ctx+cont[:-1]).
+                    # i.e. continuations can be sliced at diff points. Collator ensures we have sufficient greedy_tokens
+                    # by choosing key with longest cont if group_by="contexts".
+                    max_equal = (
+                        greedy_tokens[:, -cont_toks.shape[1] :] == cont_toks
+                    ).all()
 
                     # Obtain log-probs at the corresponding continuation token indices
                     # last_token_slice = logits[:, -1, :].squeeze(0).tolist()
@@ -1280,6 +1358,9 @@ class HFLM(TemplateLM):
             if self.backend == "causal":
                 # max len for inputs = max length, minus room to generate the max new tokens
                 max_ctx_len = self.max_length - max_gen_toks
+                assert max_ctx_len > 0, (
+                    f"Invalid configuration: requested max tokens to generate ({max_gen_toks}) must be less than model's maximum sequence length ({self.max_length})."
+                )
             elif self.backend == "seq2seq":
                 # max len for inputs = encoder's whole max_length
                 max_ctx_len = self.max_length
@@ -1330,13 +1411,18 @@ class HFLM(TemplateLM):
 
         return res
 
-    def apply_chat_template(self, chat_history: List[Dict[str, str]]) -> str:
+    def apply_chat_template(
+        self, chat_history: List[Dict[str, str]], add_generation_prompt: bool = True
+    ) -> str:
         """
         Method to apply a chat template to a list of chat history between user and model.
         """
         try:
             chat_templated = self.tokenizer.apply_chat_template(
-                chat_history, tokenize=False, add_generation_prompt=True
+                chat_history,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+                continue_final_message=not add_generation_prompt,
             )
         except jinja2.exceptions.TemplateError:
             eval_logger.warning(
@@ -1344,7 +1430,10 @@ class HFLM(TemplateLM):
             )
             chat_history = [msg for msg in chat_history if msg["role"] != "system"]
             chat_templated = self.tokenizer.apply_chat_template(
-                chat_history, tokenize=False, add_generation_prompt=True
+                chat_history,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+                continue_final_message=not add_generation_prompt,
             )
 
         return chat_templated

@@ -1,4 +1,5 @@
 import copy
+import logging
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -7,7 +8,6 @@ import transformers
 from tqdm import tqdm
 from transformers import BatchEncoding
 
-from lm_eval import utils
 from lm_eval.api.instance import Instance
 from lm_eval.api.registry import register_model
 from lm_eval.models.huggingface import HFLM
@@ -17,6 +17,7 @@ from lm_eval.models.utils import (
     handle_stop_sequences,
     pad_and_concat,
     replace_placeholders,
+    resize_image,
     stop_sequences_criteria,
 )
 
@@ -24,7 +25,7 @@ from lm_eval.models.utils import (
 DEFAULT_IMAGE_PLACEHOLDER = "<image>"
 
 
-eval_logger = utils.eval_logger
+eval_logger = logging.getLogger(__name__)
 
 
 @register_model("hf-multimodal")
@@ -45,15 +46,35 @@ class HFMultimodalLM(HFLM):
         # TODO: handle whitespace in image placeholder (replacement)
         max_images: Optional[int] = 999,
         convert_img_format=False,
+        # For image resizing
+        min_pixels: Optional[int] = None,
+        max_pixels: Optional[int] = None,
+        image_width: Optional[int] = None,
+        image_height: Optional[int] = None,
+        image_max_side: Optional[int] = None,
         **kwargs,
     ):
+        self.image_width = image_width
+        self.image_height = image_height
+        self.image_max_side = image_max_side
+        if self.image_max_side and (self.image_width or self.image_height):
+            raise ValueError(
+                "Ambiguous config for image resize: you can not specify both "
+                "image_max_side and (image_width or image_height)"
+            )
+
+        # init pixels before calling tokenizer creation to avoid errors
+        self.pixels = ({"min_pixels": min_pixels} if min_pixels else {}) | (
+            {"max_pixels": max_pixels} if max_pixels else {}
+        )
+
         # We initialize using HFLM's init. Sub-methods like _create_model and _create_tokenizer
         # modify init behavior.
         super().__init__(pretrained, **kwargs)
 
-        assert (
-            self.batch_size != "auto"
-        ), "Batch size 'auto' is not yet supported for hf-multimodal models."
+        assert self.batch_size != "auto", (
+            "Batch size 'auto' is not yet supported for hf-multimodal models."
+        )
         self.chat_applied: bool = False
         # TODO: phi-3.5 "image placeholders" are <image_1>, <image_2>, ... in order. how to handle this case
 
@@ -73,9 +94,9 @@ class HFMultimodalLM(HFLM):
                     or getattr(self.config, "image_token_index", None)
                 )
             )
-            assert (
-                self.image_token_id is not None
-            ), "Must have a non-None image_token_id to evaluate a Hugging Face AutoModelForVision2Seq model. Please pass `image_token_id` in `--model_args` if model's config does not already specify one."
+            assert self.image_token_id is not None, (
+                "Must have a non-None image_token_id to evaluate a Hugging Face AutoModelForVision2Seq model. Please pass `image_token_id` in `--model_args` if model's config does not already specify one."
+            )
             # get the string this token ID corresponds to
             self.image_token = self.tok_decode(
                 [self.image_token_id], skip_special_tokens=False
@@ -135,6 +156,7 @@ class HFMultimodalLM(HFLM):
             model_name,
             revision=revision,
             trust_remote_code=trust_remote_code,
+            **self.pixels,
             # use_fast=use_fast_tokenizer,
         )
 
@@ -200,7 +222,9 @@ class HFMultimodalLM(HFLM):
 
         return context_enc, continuation_enc, image_enc
 
-    def apply_chat_template(self, chat_history: List[Dict[str, str]]) -> str:
+    def apply_chat_template(
+        self, chat_history: List[Dict[str, str]], add_generation_prompt: bool = True
+    ) -> str:
         self.chat_applied = True
         if not self.interleave:
             for content in chat_history:
@@ -250,7 +274,9 @@ class HFMultimodalLM(HFLM):
                     )
 
         return self.processor.apply_chat_template(
-            chat_history, add_generation_prompt=True
+            chat_history,
+            add_generation_prompt=add_generation_prompt,
+            continue_final_message=not add_generation_prompt,
         )
 
     def chat_template(self, chat_template: Union[bool, str] = False) -> Optional[str]:
@@ -373,6 +399,9 @@ class HFMultimodalLM(HFLM):
         return batched_imgs
 
     def loglikelihood_rolling(self, requests: List[Instance]) -> List[float]:
+        if requests and len(requests[0].args) < 3:
+            # Fall back to non-multimodal generation.
+            return super().loglikelihood_rolling(requests=requests)
         raise NotImplementedError(
             "model type `hf-multimodal` does not support loglikelihood_rolling. Use 'hf' model type for text-only loglikelihood_rolling tasks ",
             "this is because we do not support measuring the loglikelihood a model assigns to an image.",
@@ -381,6 +410,9 @@ class HFMultimodalLM(HFLM):
     def loglikelihood(
         self, requests: List[Instance], disable_tqdm: bool = False
     ) -> List[Tuple[float, bool]]:
+        if requests and len(requests[0].args) < 3:
+            # Fall back to non-multimodal generation.
+            return super().loglikelihood(requests=requests, disable_tqdm=disable_tqdm)
         raise NotImplementedError(
             "'loglikelihood' requests for model type `hf-multimodal` are not yet tested. This feature will be enabled when a loglikelihood-based multiple-choice VQA dataset is added!"
         )
@@ -407,9 +439,11 @@ class HFMultimodalLM(HFLM):
                 )
             )
 
-        return self._loglikelihood_tokens(new_reqs, disable_tqdm=disable_tqdm)
+        return self._multimodal_loglikelihood_tokens(
+            new_reqs, disable_tqdm=disable_tqdm
+        )
 
-    def _loglikelihood_tokens(
+    def _multimodal_loglikelihood_tokens(
         self,
         requests: List[
             Tuple[Tuple[None, str, str], List[int], List[int], List[int]]
@@ -598,7 +632,10 @@ class HFMultimodalLM(HFLM):
     def generate_until(
         self, requests: List[Instance], disable_tqdm: bool = False
     ) -> List[str]:
-        # TODO: back out to HFLM.generate_until() for all requests without aux_arguments (text-only reqs)
+        if requests and len(requests[0].args) < 3:
+            # Fall back to non-multimodal generation.
+            return super().generate_until(requests=requests, disable_tqdm=disable_tqdm)
+
         res = []
 
         def _collate(x):
@@ -634,7 +671,15 @@ class HFMultimodalLM(HFLM):
         for chunk in chunks:
             contexts, all_gen_kwargs, aux_arguments = zip(*chunk)
 
-            visuals = [arg["visual"] for arg in aux_arguments]
+            visuals = [
+                [
+                    resize_image(
+                        img, self.image_width, self.image_height, self.image_max_side
+                    )
+                    for img in arg["visual"]
+                ]
+                for arg in aux_arguments
+            ]
 
             if not isinstance(contexts, list):
                 contexts = list(
