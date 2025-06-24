@@ -12,20 +12,18 @@ process_docs: !function utils.process_docs
 # description: "Answer questions based on provided passages:\n\n"
 
 # 使用自定义函数生成输入文本
-doc_to_text: !function utils.format_chat_prompt
+doc_to_text: !function utils_selected.format_chat_prompt
 doc_to_target: "{{answers}}"
 
 dataset_kwargs:
-  data_files: /home/feihm/llm-fei/Data/NQ/contriever_nq_all_train/train.json
+  data_files: /home/feihm/llm-fei/Data/NQ/contriever_nq_all_train/train2000.json
 
 generation_kwargs:
   until:
     - "<|im_end|>"      # 常见的instruct模型结束标记
     - "<|endoftext|>"
-    - "\n\n"
   do_sample: false
   # temperature: 0.0
-  # max_new_tokens: 256
 
 filter_list:
   - name: remove_whitespace
@@ -40,7 +38,7 @@ metric_list:
     higher_is_better: true
     ignore_case: true
     ignore_punctuation: true
-  # - metric: !function utils.custom_exact_match
+  # - metric: !function utils_selected.custom_exact_match
   #   aggregation: mean
   #   higher_is_better: true
 
