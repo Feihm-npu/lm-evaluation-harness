@@ -7,7 +7,7 @@ output_type: generate_until
 test_split: train
 
 # 使用自定义函数预处理数据集
-process_docs: !function utils.process_docs
+process_docs: !function utils_selected.process_docs
 
 # description: "Answer questions based on provided passages:\n\n"
 

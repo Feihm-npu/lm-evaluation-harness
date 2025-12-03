@@ -39,7 +39,7 @@ def process_docs(dataset):
         # 确保passages字段存在
         doc['ctxs'].sort(key=lambda x: x['hasanswer'], reverse=True)  # 确保有答案的ctx在前
         formatted_docs = [
-            f"[document]{paragraph_template.format(title=ctx['title'], text=ctx['text']).strip()}[/document]" for ctx in doc['ctxs'][:5]
+            f"[document]{paragraph_template.format(title=ctx['title'], text=ctx['text']).strip()}[/document]" for ctx in doc['ctxs'][:10]
         ]
         docs = "\n".join(formatted_docs)
         doc["passages"] = docs
