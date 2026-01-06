@@ -1,0 +1,27 @@
+task: sst2
+dataset_path: stanfordnlp/sst2
+dataset_name: default
+output_type: multiple_choice
+training_split: train
+validation_split: validation
+# test_split: test
+
+# 1. 对应你训练时的 Prompt 模板
+# 注意：Jinja2 中 {{sentence}} 对应数据集里的 sentence 列
+doc_to_text: "You are a helpful sentiment classifier. Classify the sentiment of the following sentence as negative or positive.\n\nSentence: {{sentence}}\n\nSentiment:"
+
+# 2. 定义选项列表 (对应 label 0 和 1)
+doc_to_choice: ["negative", "positive"]
+
+# 3. 将数据集里的 label (0或1) 映射为上面的选项文本
+doc_to_target: "{{['negative', 'positive'][label]}}"
+
+# 4. 评估指标
+metric_list:
+  - metric: acc
+    aggregation: mean
+    higher_is_better: true
+
+# 5. 元数据
+metadata:
+  version: 1.0
